@@ -1,5 +1,6 @@
 import re
 import logging
+import tempfile
 from mypy import api as mypy_api
 from pyls import hookimpl
 
@@ -8,71 +9,57 @@ line_pattern = r"([^:]+):(?:(\d+):)?(?:(\d+):)? (\w+): (.*)"
 log = logging.getLogger(__name__)
 
 
-def parse_line(line, document=None):
-    '''
+def parse_line(line, document):
+    """
     Return a language-server diagnostic from a line of the Mypy error report;
     optionally, use the whole document to provide more context on it.
-    '''
+    """
     result = re.match(line_pattern, line)
-    if result:
-        file_path, lineno, offset, severity, msg = result.groups()
+    if not result:
+        return None
 
-        if file_path != "<string>":  # live mode
-            # results from other files can be included, but we cannot return
-            # them.
-            if document and document.path and not document.path.endswith(
-                    file_path):
-                log.warning("discarding result for %s against %s", file_path,
-                            document.path)
-                return None
+    file_path, lineno, offset, severity, msg = result.groups()
+    if not document.path.endswith(file_path):
+        log.warning("discarding result for %s against %s", file_path, document.path)
+        return None
 
-        lineno = int(lineno or 1) - 1  # 0-based line number
-        offset = int(offset or 1) - 1  # 0-based offset
-        errno = 2
-        if severity == 'error':
-            errno = 1
-        diag = {
-            'source': 'mypy',
-            'range': {
-                'start': {'line': lineno, 'character': offset},
-                # There may be a better solution, but mypy does not provide end
-                'end': {'line': lineno, 'character': offset + 1}
-            },
-            'message': msg,
-            'severity': errno
-        }
-        if document:
-            # although mypy does not provide the end of the affected range, we
-            # can make a good guess by highlighting the word that Mypy flagged
-            word = document.word_at_position(diag['range']['start'])
-            if word:
-                diag['range']['end']['character'] = (
-                    diag['range']['start']['character'] + len(word))
+    lineno = int(lineno or 1) - 1  # 0-based line number
+    offset = int(offset or 1) - 1  # 0-based offset
+    start = {"line": lineno, "character": offset}
 
-        return diag
+    # although mypy does not provide the end of the affected range, we
+    # can make a good guess by highlighting the word that mypy flagged
+    word = document.word_at_position(start)
+    end = {
+        "line": lineno,
+        "character": offset + (len(word) if word else 1),
+    }  # fallback to len of 1
+
+    return {
+        "source": "mypy",
+        "range": {"start": start, "end": end},
+        "message": msg,
+        "severity": 1 if severity == "error" else 2,
+    }
 
 
 @hookimpl
 def pyls_lint(config, workspace, document, is_saved):
-    settings = config.plugin_settings('pyls_mypy')
-    live_mode = settings.get('live_mode', True)
-    if live_mode:
-        args = ['--incremental',
-                '--show-column-numbers',
-                '--follow-imports', 'silent',
-                '--command', document.source]
-    elif is_saved:
-        args = ['--incremental',
-                '--show-column-numbers',
-                '--follow-imports', 'silent',
-                document.path]
-    else:
-        return []
+    args = ["--no-pretty", "--show-column-numbers"]
+    if is_saved:
+        return execute_mypy(args + 1, document)
 
-    if settings.get('strict', False):
-        args.append('--strict')
+    with tempfile.NamedTemporaryFile("wt") as shadow_file:
+        shadow_file.write(document.source)
+        shadow_file.flush()
 
-    report, errors, _ = mypy_api.run(args)
+        return execute_mypy(
+            args + ["--shadow-file", document.path, shadow_file.name], document
+        )
+
+
+def execute_mypy(args, document):
+    report, errors, _ = mypy_api.run(args + [document.path])
 
     diagnostics = []
     for line in report.splitlines():
